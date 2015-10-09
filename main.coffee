@@ -2,6 +2,8 @@ dgram = require 'dgram'
 assert = require 'assert'
 http = require 'http'
 
+Quality = require './quality'
+
 server_port = 495
 timeout = 10
 
@@ -45,143 +47,86 @@ timeout_timer = null
 
 socket = dgram.createSocket('udp4')
 
-caculate_metric = (delay, jitter, reliability, cost)->
-  assert(jitter >= 0)
-  assert(0 <= reliability <= 1, "reliability: #{reliability}")
-  assert(cost >= 0)
+route_quality = (from, to, next_hop = servers[from].next_hop[to])->
+  assert next_hop?
+  assert from != next_hop
+  assert from != to
 
-  delay + (1 - reliability) * 6 + cost * 0.1
+  result = new Quality()
 
-route_metric = (server_id, from, to, next_hop)->
-
-  #console.log "route_metric(#{server_id}, #{from}, #{to}, #{next_hop})"
-
-
-  # delay 由于涉及时差问题，对内、对外、补偿权重必须是一致的。
-  # 其他几个变量对内、对外权重可以不一致。
-
-  delay = 0
-  internal_reliability = 1
-  internal_jitter = 0
-  internal_cost = 0
-
-  external_reliability = 1
-  external_jitter = 0
-  external_cost = 0
-
-  current = server_id
+  current = from
   next = next_hop
   route = [current, next]
 
-  # 正向路由
   while true
-    if next == 0 # from server_id to region_id 型路由到达出口
-      assert(from != 0)
-      quality = gateways[current][to]
-      return Number.POSITIVE_INFINITY if !quality or quality.reliability <= 0 # 网络不通，视为黑洞
-      #console.log '-gateway-', current, to, quality
-      delay += quality.delay
-      external_reliability *= Math.sqrt(quality.reliability)
-      external_jitter += quality.jitter / 2
-      external_cost += servers[current].outbound_cost
-      internal_reliability *= Math.sqrt(quality.reliability)
-      internal_jitter += quality.jitter / 2
-      internal_cost += servers[current].inbound_cost
-      if current == from # 出口直达
-        return caculate_metric(delay, internal_jitter + external_jitter, internal_reliability * external_reliability, internal_cost + external_cost)
-      next = servers[current].routes[0][from]
-      route = [current, next]
-      while true # 计算返程路线
-        # 计算网络质量
-        quality = servers[next].quality[current]
-        return Number.POSITIVE_INFINITY if !quality or quality.reliability <= 0 # 网络不通，视为黑洞
-        #console.log '-2-', current, next, quality
-        delay += quality.delay
-        internal_jitter += quality.jitter
-        internal_reliability *= quality.reliability
-        internal_cost += servers[current].outbound_cost + servers[next].inbound_cost
-        # 寻找下一跳
-        if next == from # 往返路径结束
-          return caculate_metric(delay, internal_jitter + external_jitter, internal_reliability * external_reliability, internal_cost + external_cost)
-        else
-          current = next
-          next = servers[current].routes[0][from]
-          assert(next?) # 返程的目标是server，相当于 from all to server_id 型路由，由于 server 两两相连，下一跳一定是存在的，最坏情况也是直达
-          if next in route # 环路
-            return Number.POSITIVE_INFINITY
-          else
-            route.push next
+    quality = servers[next].quality[current]
+    return Quality.unreachable if !quality or quality.reliability <= 0 # 网络不通，视为黑洞
+    result.concat(quality.delay, quality.jitter, quality.reliability, servers[current].outbound_cost + servers[next].inbound_cost)
+    return result if next == to # 到达
+
+    # 寻找下一跳
+    current = next
+    next = servers[current].next_hop[to]
+    assert next #to server_id 型路由，由于 server 两两相连，下一跳一定是存在的，最坏情况也是直达
+    if next in route # 环路
+      return Quality.unreachable
     else
-      # 计算网络质量
-      quality = servers[next].quality[current]
-      return Number.POSITIVE_INFINITY if !quality or quality.reliability <= 0 # 网络不通，视为黑洞
-      #console.log '-3-', current, next, quality
-      delay += quality.delay
+      route.push next
 
-      if from == 0 # 对内
-        internal_reliability *= quality.reliability
-        internal_jitter += quality.jitter
-        internal_cost += servers[current].outbound_cost + servers[next].inbound_cost
-        if next == to
-          return caculate_metric(delay, internal_jitter + external_jitter, internal_reliability * external_reliability, internal_cost + external_cost)
-      else
-        external_reliability *= quality.reliability
-        external_jitter += quality.jitter
-        external_cost += servers[current].outbound_cost + servers[next].inbound_cost
+route_metric = (from, to, next_hop)->
+  route_quality(from, to, next_hop).metric()
 
-      # 寻找下一跳
-      current = next
-      next = servers[current].routes[from][to]
-      if next?
-        if next in route # 环路
-          return Number.POSITIVE_INFINITY
-        else
-          route.push next
-      else
-        assert(from != 0) # from all to server_id 型路由，由于 server 两两相连，下一跳一定是存在的，最坏情况也是直达
-        return Number.POSITIVE_INFINITY # 对于from server_id to region 型路由，如果下一跳不存在，意味着出口没有已知路线可达，是黑洞
+gateway_metric = (from, to, gateway)->
+  quality = gateways[gateway][to]
+  assert quality
+  result = new Quality(quality.delay, quality.jitter, quality.reliability, servers[gateway].outbound_cost + servers[gateway].inbound_cost)
+  if from != gateway
+    result.concat route_quality(from, gateway)
+    result.concat route_quality(gateway, from)
+  result.metric()
 
-
-  # 返程 (下行) 路由
-  #console.log '-2-', next
-
-
-update_route = (server, from, to)->
-  current_next_hop = server.routes[from][to]
-
-  # 计算当前路线
-  if current_next_hop?
-    current_metric = route_metric(server.id, from, to, current_next_hop)
+update_route = (server, to)->
+  # 计算当前和最优路线
+  if to.name? # is region
+    type = 'gateway'
+    current_route = server[type][to.id]
+    if current_route
+      current_metric = gateway_metric(server.id, to.id, current_route)
+    else
+      current_metric = Number.POSITIVE_INFINITY
+    best_route = current_route
+    best_metric = current_metric
+    for index, route_server of servers when route_server.id != current_route and gateways[route_server.id]? and gateways[route_server.id][to.id]
+      metric = gateway_metric(server.id, to.id, route_server.id)
+      if metric < best_metric
+        best_route = route_server.id
+        best_metric = metric
   else
-    assert(from != 0) # from all to server_id 型路由，由于 server 两两相连，下一跳一定是存在的，最坏情况也是直达
-    current_metric = Number.POSITIVE_INFINITY # 对于from server_id to region 型路由，如果下一跳不存在，意味着出口没有已知路线可达，是黑洞
+    assert(to.inbound_cost?) # is server
+    type = 'next_hop'
+    current_route = server[type][to.id]
+    assert(current_route) # 对于 to server 型路由，下一跳一定是存在的
+    current_metric = route_metric(server.id, to.id, current_route)
+    best_route = current_route
+    best_metric = current_metric
+    for index, route_server of servers when route_server.id != current_route and route_server.id != server.id # 对于 to server型路由，下一跳是自己是没有意义的
+      metric = route_metric(server.id, to.id, route_server.id)
+      if metric < best_metric
+        best_route = route_server.id
+        best_metric = metric
 
-  # 计算更优路线
-  best_next_hop = current_next_hop
-  best_metric = current_metric
-
-  for index, next_hop_server of servers when next_hop_server.id != current_next_hop and next_hop_server != server and next_hop_server.id != from
-    #console.log parseInt(next_hop), server.id
-    #console.log next_hop,current_next_hop
-    metric = route_metric(server.id, from, to, next_hop_server.id)
-    if metric < best_metric
-      best_next_hop = next_hop_server.id
-      best_metric = metric
-  if from != 0
-    metric = route_metric(server.id, from, to, 0)
-    if metric < best_metric
-      best_next_hop = 0
-      best_metric = metric
+  # 决定是否变更
 
   now = new Date().getTime() / 1000
-  if current_next_hop != best_next_hop and (current_metric is Number.POSITIVE_INFINITY or (current_metric - best_metric - 0.01) * (now - server.updated_at[from][to]) > 10)
-    console.log "update ##{sequence}: server#{server.id} from #{from} to #{to} next hop #{current_next_hop}(#{current_metric}) -> #{best_next_hop}(#{best_metric})"
-    server.routes[from][to] = best_next_hop
-    server.updated_at[from][to] = now
+  if current_route != best_route and (current_metric is Number.POSITIVE_INFINITY or (current_metric - best_metric - 0.01) * (now - server[type+'_updated_at'][to.id]) > 10)
+    console.log server[type+'_updated_at'][to.id],server[type+'_updated_at'], to.id
+    console.log "update ##{sequence}: #{type} server #{server.id} to #{to.id}: #{current_route}(#{current_metric}) -> #{best_route}(#{best_metric}) age #{now - server[type+'_updated_at'][to.id]}"
+    server[type][to.id] = best_route
+    server[type+'_updated_at'][to.id] = now
     updating = setInterval ->
-      send_route(server, from, to, best_next_hop)
+      send_route server, to.id, best_route, type
     , 1000
-    send_route(server, from, to, best_next_hop)
+    send_route server, to.id, best_route, type
     timeout_timer = setTimeout ->
       delete server.address
       delete server.port
@@ -192,38 +137,29 @@ update_route = (server, from, to)->
     return true
 
   false
-send_route = (server, from, to, next_hop)->
-  message = {sequence: sequence, from: from, to: to, next_hop: next_hop}
-  if server == from
-    gateway = server
-    while next_hop != 0
-      gateway = next_hop
-      next_hop = servers[gateway].routes[from][to]
-    message.gateway = gateway
+
+send_route = (server, to, route, type)->
+  message = {sequence: sequence, to: to}
+  message[type] = route
   message = JSON.stringify message
   socket.send message, 0, message.length, server.port, server.address
 reset_route = (server)->
   now = new Date().getTime() / 1000
   server.quality = {}
-  # 目标地址是 server 的 from all to server_id 型路由, routes[0][server_id], 对于直连目标节点的，next_hop = server_id
-  # 目标地址是 region 的 from server_id to region_id 型路由, routes[server_id][region_id], 对于直连出口的，next_hop = 0
-  server.routes = {}
-  server.updated_at = {}
-  server.routes[0] = {}
-  server.updated_at[0] = {}
+  server.next_hop = {}
+  server.next_hop_updated_at = {}
+  server.gateway = {}
+  server.gateway_updated_at = {}
   for i,s of servers
-    server.routes[0][i] = parseInt(i)
-    server.updated_at[0][i] = now
-    server.routes[i] = {}
-    server.updated_at[i] = {}
-    for region_id, region of regions when gateways[server.id]? and gateways[server.id][region_id]?
-      server.routes[i][region_id] = 0
-      server.updated_at[i][region_id] = now
+    server.next_hop[s.id] = s.id
+    server.next_hop_updated_at[s.id] = now
+  for region_id, region of regions when gateways[server.id]? and gateways[server.id][region_id]?
+    server.gateway[region_id] = server.id
+    server.gateway_updated_at[region_id] = now
 
 socket.on 'message', (message, rinfo) ->
 
   message = JSON.parse(message)
-  #console.log message
   server = servers[message.server_id]
   return unless server?
 
@@ -244,12 +180,11 @@ socket.on 'message', (message, rinfo) ->
     sequence += 1
 
   if !updating?
-    for server_id, server of servers when server.address?
-      for to of servers when to != server_id
-        return if update_route(server, 0, parseInt(to))
-      for from of servers
-        for region in regions
-          return if update_route(server, parseInt(from), region.id)
+    for i, server of servers when server.address?
+      for j, to_server of servers when server.id != to_server.id
+        return if update_route(server, to_server)
+      for j, to_region of regions
+        return if update_route(server, to_region)
 
 for server_id, server of servers
   reset_route(server)
